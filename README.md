@@ -33,7 +33,7 @@ gcc -o network_monitor.exe network_monitor_win.c -lws2_32 -liphlpapi -lwinhttp
 # 运行 (管理员权限)
 network_monitor.exe -t 恶意IP
 network_monitor.exe -d 恶意域名
-network_monitor.exe -t 恶意IP -w 飞书webhook地址
+network_monitor.exe -t 恶意IP -w 飞书webhook地址 -s 发送飞书间隔
 ```
 
 ## Linux 编译运行
@@ -67,6 +67,7 @@ sudo python3 Network_Monitoring.py -t 恶意IP
 - `-t <IP>`: 监控指定恶意 IP
 - `-d <域名>`: 监控指定恶意域名
 - `-w <webhook_url>`: 飞书告警地址
+- `-s <time>`:  飞书告警时间间隔
 
 ## 应急处理流程建议
 
@@ -89,17 +90,3 @@ sudo python3 Network_Monitoring.py -t 恶意IP
 - 分析可疑程序的启动方式和持久化机制
 - 检查系统中类似程序或文件
 - 清理相关的启动项和计划任务
-
-## 使用建议
-1. 在应急响应初期就部署该工具，避免遗漏可疑行为
-2. 配置飞书告警，实现远程监控，提高响应效率
-3. 对高危系统进行持续监控，及早发现潜伏程序
-4. 定期更新恶意 IP/域名库，提高检测效果
-5. 保持工具以管理员/root权限运行，确保获取完整信息
-6. 建议配合其他安全工具使用，构建完整防护体系
-
-## 注意事项
-1. 首次运行前请确认系统环境是否完整
-2. 监控开始后请勿随意中断，以免遗漏可疑行为
-3. 发现异常后建议保留工具运行，继续监控其他可能的恶意行为
-4. 重点关注非工作时间的异常网络连接
