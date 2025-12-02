@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/M0rk/Knowledge/AI_project/Network_Monitor",
+      "program": "/Users/M0rk/Knowledge/AI_project/Network_Monitor/build/Release/outRelease"
+    }
+  ]
+}
