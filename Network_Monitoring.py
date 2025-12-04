@@ -32,12 +32,10 @@ def check_permissions():
             sys.exit(1)
 
 def is_valid_ip(ip: str) -> bool:
-    """
-    检查是否为有效的IP地址格式
-    """
+    """只接受合法的 IPv4 地址"""
     try:
-        ipaddress.ip_address(ip)
-        return True
+        ip_obj = ipaddress.ip_address(ip)
+        return ip_obj.version == 4
     except ValueError:
         return False
 
@@ -105,6 +103,13 @@ def resolve_domain(domain: str) -> Set[str]:
 
     return ipv4_addresses
 
+def normalize_process_name(name: str) -> str:
+    key = "Cursor Helper (Plugin)"
+    if name and key in name:
+        return key
+    return name
+
+
 def get_process_tree(pid):
     try:
         process = psutil.Process(pid)
@@ -157,12 +162,13 @@ def monitor_connection(target_ip: str, webhook_url: str = None,
                     found = True
                     try:
                         process = psutil.Process(conn.pid)
+                        name = normalize_process_name(process.name())
                         
                         info = [
+                            f"进程名称: {name}",
                             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                             f"目标IP: {target_ip}",
                             f"进程ID: {conn.pid}",
-                            f"进程名称: {process.name()}",
                             f"进程路径: {process.exe()}",
                             f"进程命令行: {' '.join(process.cmdline())}",
                             f"本地地址: {conn.laddr[0] if isinstance(conn.laddr, tuple) else conn.laddr.ip}:{conn.laddr[1] if isinstance(conn.laddr, tuple) else conn.laddr.port}",
@@ -187,7 +193,8 @@ def monitor_connection(target_ip: str, webhook_url: str = None,
     return found, last_send_time
 
 def monitor_all_ips(targets: Set[str], webhook_url: str = None, 
-                   send_interval: int = None):
+                   send_interval: int = None,
+                   domain: str = None):
     """
     监控所有目标IP地址
     """
@@ -198,21 +205,109 @@ def monitor_all_ips(targets: Set[str], webhook_url: str = None,
     print("=" * 50)
 
     last_send_time = None
+    last_resolve_time = time.time()
+    DNS_RESOLVE_INTERVAL = 5      # 域名DNS刷新间隔（秒）
+    POLL_INTERVAL = 0.2           # 监控轮询间隔（秒）
     while True:
-        for ip in targets:
+        # 周期性刷新域名解析结果
+        if domain:
+            now = time.time()
+            if now - last_resolve_time >= DNS_RESOLVE_INTERVAL:
+                resolved_ips = resolve_domain(domain)
+                if resolved_ips:
+                    targets.clear()
+                    targets.update(resolved_ips)
+                    print(f"\n域名 {domain} 解析结果已刷新:")
+                    for ip in sorted(targets):
+                        print(f"- {ip}")
+                    print("=" * 50)
+                last_resolve_time = now
+
+        # 遍历当前目标IP集合
+        for ip in list(targets):
             found, new_send_time = monitor_connection(ip, webhook_url, last_send_time, send_interval)
             if found and new_send_time:
                 last_send_time = new_send_time
-        time.sleep(1)
+        # 控制轮询间隔
+        time.sleep(POLL_INTERVAL)
+
+def monitor_all_connections(webhook_url: str = None, print_interval: int = 5):
+    """全局IPv4连接监控模式（无 -t/-d 参数时使用）
+
+    :param webhook_url: 预留参数，目前全局模式不发飞书，仅本地显示
+    :param print_interval: 前台表格刷新间隔（秒）
+    """
+    POLL_INTERVAL = 0.2               # 抓取间隔（秒，毫秒级）
+    PRINT_INTERVAL = float(print_interval)  # 界面刷新间隔（秒）
+    # ip -> (local_ip, local_port, remote_port, pid, name, path)
+    seen_infos = {}
+    header_printed = False
+    last_print_time = time.time()
+    while True:
+        connections = psutil.net_connections(kind='all')
+        for conn in connections:
+            try:
+                if not conn.raddr:
+                    continue
+                # 只处理IPv4
+                if isinstance(conn.raddr, tuple):
+                    raddr_ip, raddr_port = conn.raddr[0], conn.raddr[1]
+                else:
+                    continue
+                if not is_valid_ip(raddr_ip):
+                    continue
+                # 过滤 0.0.0.0 和 127.0.0.1
+                if raddr_ip in ("0.0.0.0", "127.0.0.1"):
+                    continue
+
+                laddr_ip, laddr_port = (conn.laddr[0], conn.laddr[1]) if isinstance(conn.laddr, tuple) else (None, None)
+                if not laddr_ip or not is_valid_ip(laddr_ip):
+                    continue
+
+                # 只记录首见该远程IP的一条连接信息
+                if raddr_ip in seen_infos:
+                    continue
+
+                pid = conn.pid or 0
+                try:
+                    process = psutil.Process(pid) if pid else None
+                    name = normalize_process_name(process.name()) if process else "未知进程"
+                    path = process.exe() if process else "无法获取路径"
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    name = "未知进程"
+                    path = "无法获取路径"
+
+                seen_infos[raddr_ip] = (laddr_ip, laddr_port, raddr_port, pid, name, path)
+            except Exception:
+                continue
+
+        # 每 PRINT_INTERVAL 秒刷新一次输出表格
+        now = time.time()
+        if now - last_print_time >= PRINT_INTERVAL:
+            if not header_printed:
+                print("\n实时统计本机所有 IPv4 连接状态（按远程IP去重，只打印首见连接信息）")
+                header_printed = True
+            print("\r", end="")
+            print("源地址           源端口 -> 目的地址         目的端口 PID    进程名称                    进程路径")
+            print("-----------------------------------------------------------------------------------------------------------")
+            for ip, (laddr_ip, laddr_port, raddr_port, pid, name, path) in seen_infos.items():
+                print(f"{laddr_ip:<15} {laddr_port:<5} -> {ip:<15} {raddr_port:<8} {pid:<6} {name:<25} {path:<60}")
+            print("\n按 Ctrl+C 停止监控...", end="")
+            last_print_time = now
+
+        time.sleep(POLL_INTERVAL)
+
 
 def main():
     parser = argparse.ArgumentParser(description='网络连接监控工具')
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument('-t', '--target', help='要监控的目标IP地址')
     group.add_argument('-d', '--domain', help='要监控的目标域名')
     parser.add_argument('-w', '--webhook', help='飞书webhook URL')
     parser.add_argument('-s', '--send-interval', type=int, default=300,
                       help='飞书通知发送间隔(秒)')
+    parser.add_argument('-a', '--all', type=int,
+                      help='全局IPv4统计模式，前台刷新间隔(秒)，例如 -a 5')
     
     args = parser.parse_args()
     
@@ -221,13 +316,27 @@ def main():
     
     targets = set()
     
+    # 处理 -a 全局模式（与 -t/-d 互斥）
+    if args.all is not None:
+        if args.target or args.domain:
+            print("错误: -a 不能与 -t 或 -d 同时使用")
+            sys.exit(1)
+        try:
+            monitor_all_connections(args.webhook, print_interval=args.all)
+        except KeyboardInterrupt:
+            print("\n停止监控")
+            sys.exit(0)
+        return
+
+    # 若既没有target也没有domain也没有-a，则提示用法
+    if not args.target and not args.domain:
+        parser.print_help()
+        sys.exit(1)
+
     # 处理目标IP
     if args.target:
         if not is_valid_ip(args.target):
             print(f"错误: {args.target} 不是有效的IP地址")
-            sys.exit(1)
-        if not is_public_ipv4(args.target):
-            print(f"错误: {args.target} 不是有效的公网IPv4地址")
             sys.exit(1)
         targets.add(args.target)
     
@@ -244,7 +353,10 @@ def main():
     
     # 开始监控
     try:
-        monitor_all_ips(targets, args.webhook, args.send_interval)
+        # 如果是域名模式，传入域名；IP模式则不需要
+        domain = args.domain if args.domain else None
+        monitor_all_ips(targets, args.webhook, args.send_interval,
+                        domain=domain)
     except KeyboardInterrupt:
         print("\n停止监控")
         sys.exit(0)
