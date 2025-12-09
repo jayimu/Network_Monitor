@@ -1,28 +1,8 @@
 # 恶意程序网络行为监控与应急处理工具
 
-针对恶意程序的网络连接行为监控工具，特别适用于应急响应场景。通过监控特定 IP/域名的网络连接，快速定位潜伏的恶意程序，协助应急处理人员及时发现和清除威胁。
+面向应急响应场景的一体化轻量工具，实时捕获本机 IPv4 连接并按「远程 IP+端口」去重，支持对指定恶意 IP/域名进行秒级定位，可迅速锁定潜伏后门、时间触发式木马或任何可疑进程；同时持续记录异常外联日志，并通过飞书实时推送告警，帮助一线人员完成从发现、取证到清除的闭环处置。
 
-## 应用场景
 
-### 应急处理
-- 已知恶意 IP/域名的程序定位
-- 发现潜伏期的恶意程序（如等待特定时间才激活的后门）
-- 快速确定受感染主机上的恶意进程
-
-### 持续监控
-- 监控可疑程序的对外连接行为
-- 记录程序异常网络行为
-- 通过飞书实时推送告警信息
-
-### TODO
-
-1. **挖矿程序检测**：
-   - 监控已知矿池地址
-   - 发现异常网络连接及其关联进程
-
-2. **后门程序检测**：
-   - 监控可疑的对外连接
-   - 识别定时回连的隐藏程序
 
 ## Windows 编译运行
 
@@ -31,9 +11,11 @@
 gcc -o network_monitor.exe network_monitor_win.c -lws2_32 -liphlpapi -lwinhttp
 
 # 运行 (管理员权限)
-network_monitor.exe -t 恶意IP
+network_monitor.exe -t 恶意IP            # 支持通配符，如 '115.*.*.134'
 network_monitor.exe -d 恶意域名
+network_monitor.exe -a 5                #全局监控
 network_monitor.exe -t 恶意IP -w 飞书webhook地址
+network_monitor.exe -t 115.*.*.* -w 飞书webhook地址
 ```
 
 ## Linux 编译运行
@@ -47,6 +29,7 @@ gcc -o network_monitor network_monitor_linux.c -lpcap -lcurl
 # 运行
 sudo ./network_monitor -t 恶意IP
 sudo ./network_monitor -d 恶意域名
+sudo ./network_monitor -a 5
 sudo ./network_monitor -t 恶意IP -w 飞书webhook地址
 ```
 
@@ -56,50 +39,89 @@ sudo ./network_monitor -t 恶意IP -w 飞书webhook地址
 # 安装依赖
 pip install -r requirements.txt
 
-# Windows运行(管理员权限)
 python Network_Monitoring.py -t 恶意IP
 
-# Linux运行
-sudo python3 Network_Monitoring.py -t 恶意IP
 ```
 
 ## 参数说明
-- `-t <IP>`: 监控指定恶意 IP
-- `-d <域名>`: 监控指定恶意域名
-- `-w <webhook_url>`: 飞书告警地址
 
-## 应急处理流程建议
+### 主要参数（三选一，不能同时使用）
 
-### 1. 前期准备
-- 部署监控工具到可疑主机
-- 配置飞书告警，确保远程及时获取信息
-- 收集已知的恶意 IP/域名列表
+#### `-t <IP地址>` - 监控指定IP（支持通配符）
+监控与指定IP地址的所有网络连接，当检测到连接时立即显示进程信息。支持通配符 IPv4（如 `115.*.*.134` 或 `115.*.*.*`），匹配任意段。
 
-### 2. 监控阶段
-- 持续监控可疑的网络连接
-- 记录所有尝试连接恶意地址的进程信息
-- 通过飞书接收实时告警
+**功能特点：**
+- 实时检测与目标IP的连接
+- 立即显示进程信息（PID、进程名、路径、用户等）
+- 支持飞书告警推送
 
-### 3. 发现异常
-- 立即记录可疑进程信息（PID、路径、命令行等）
-- 保存进程相关文件，用于后续分析
-- 必要时立即终止可疑进程
+**使用示例：**
+```bash
+# 监控特定恶意IP
+sudo ./network_monitor -t 115.120.245.134
 
-### 4. 后续处理
-- 分析可疑程序的启动方式和持久化机制
-- 检查系统中类似程序或文件
-- 清理相关的启动项和计划任务
+# 监控通配符IP（需要引号，避免被 shell 展开）
+sudo ./network_monitor -t '115.*.*.134'
 
-## 使用建议
-1. 在应急响应初期就部署该工具，避免遗漏可疑行为
-2. 配置飞书告警，实现远程监控，提高响应效率
-3. 对高危系统进行持续监控，及早发现潜伏程序
-4. 定期更新恶意 IP/域名库，提高检测效果
-5. 保持工具以管理员/root权限运行，确保获取完整信息
-6. 建议配合其他安全工具使用，构建完整防护体系
+# 配合飞书告警
+sudo ./network_monitor -t 115.120.245.134 -w https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+```
 
-## 注意事项
-1. 首次运行前请确认系统环境是否完整
-2. 监控开始后请勿随意中断，以免遗漏可疑行为
-3. 发现异常后建议保留工具运行，继续监控其他可能的恶意行为
-4. 重点关注非工作时间的异常网络连接
+
+#### `-d <域名>` - 监控指定域名
+监控与指定域名的所有网络连接，自动解析域名获取IP列表，并定期刷新DNS解析结果。
+
+**功能特点：**
+- 自动解析域名获取所有IP地址
+- 每5秒自动刷新DNS解析结果（适应动态IP）
+- 监控域名下的所有IP连接
+- 支持飞书告警推送
+
+**使用示例：**
+```bash
+# 监控可疑域名
+sudo ./network_monitor -d malicious-domain.com
+
+# 配合飞书告警
+sudo ./network_monitor -d malicious-domain.com -w https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+```
+
+
+#### `-a <刷新间隔秒数>` - 全局监控模式
+实时统计本机所有 IPv4 网络连接状态，按远程IP+端口去重显示。
+
+**功能特点：**
+- 显示本机所有活跃的IPv4连接
+- 按远程IP+端口去重，避免重复显示
+- 自动过滤LISTEN状态和本地回环地址
+- 定期刷新显示（默认5秒，可自定义）
+- 显示完整的连接信息：源地址、源端口、目的地址、目的端口、PID、进程名、进程路径
+
+**使用示例：**
+```bash
+# 每5秒刷新一次显示
+sudo ./network_monitor -a 5
+
+# 每10秒刷新一次显示
+sudo ./network_monitor -a 10
+```
+
+
+### 可选参数
+
+#### `-w <webhook_url>` - 飞书告警地址
+设置飞书机器人 webhook 地址，当检测到目标连接时自动推送告警信息。
+
+**使用示例：**
+```bash
+sudo ./network_monitor -t 115.120.245.134 -w https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-url
+```
+
+#### `-s <秒数>` - 通知间隔
+设置飞书告警的发送间隔（秒），默认30秒。避免短时间内重复发送相同告警；命中时会立即推送一次，后续按间隔节流。
+
+**使用示例：**
+```bash
+# 设置告警间隔为60秒
+sudo ./network_monitor -t 115.120.245.134 -w webhook_url -s 60
+```

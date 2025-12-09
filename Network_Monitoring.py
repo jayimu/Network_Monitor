@@ -53,6 +53,38 @@ def is_public_ipv4(ip: str) -> bool:
     except ValueError:
         return False
 
+def is_wildcard_ip(pattern: str) -> bool:
+    """检查通配符 IPv4（如 115.*.*.134 或 115.*.*.*），必须四段且至少一段为 *"""
+    if not pattern:
+        return False
+    parts = pattern.split('.')
+    if len(parts) != 4:
+        return False
+    has_wildcard = False
+    for part in parts:
+        if part == '*':
+            has_wildcard = True
+        elif part.isdigit():
+            num = int(part)
+            if num < 0 or num > 255:
+                return False
+        else:
+            return False
+    return has_wildcard
+
+def match_wildcard_ip(pattern: str, ip: str) -> bool:
+    """检查 IP 是否匹配通配符模式"""
+    if not pattern or not ip or not is_valid_ip(ip):
+        return False
+    p_parts = pattern.split('.')
+    ip_parts = ip.split('.')
+    if len(p_parts) != 4 or len(ip_parts) != 4:
+        return False
+    for i in range(4):
+        if p_parts[i] != '*' and p_parts[i] != ip_parts[i]:
+            return False
+    return True
+
 def resolve_domain(domain: str) -> Set[str]:
     """
     解析域名获取所有IPv4地址
@@ -122,6 +154,7 @@ def get_process_tree(pid):
         return ["无法获取进程树信息"]
 
 def send_to_feishu(webhook_url, message):
+    """发送飞书通知，打印状态码/返回体便于排查"""
     if not webhook_url:
         return
     headers = {"Content-Type": "application/json"}
@@ -130,14 +163,19 @@ def send_to_feishu(webhook_url, message):
         "content": {"text": message}
     }
     try:
-        response = requests.post(webhook_url, json=data, headers=headers)
-        response.raise_for_status()
+        response = requests.post(webhook_url, json=data, headers=headers, timeout=5)
+        if response.status_code != 200:
+            print(f"发送飞书通知失败: HTTP {response.status_code}, 响应: {response.text}")
+        else:
+            # 可根据需要打印简短成功提示，这里保持静默
+            pass
     except Exception as e:
         print(f"发送飞书通知失败: {e}")
 
 def monitor_connection(target_ip: str, webhook_url: str = None, 
                       last_send_time: float = None, 
-                      send_interval: int = None) -> Tuple[bool, float]:
+                      send_interval: int = None,
+                      is_wildcard: bool = False) -> Tuple[bool, float]:
     """
     监控与特定IP的连接
     """
@@ -158,7 +196,12 @@ def monitor_connection(target_ip: str, webhook_url: str = None,
                 else:
                     continue
                 
-                if raddr_ip == target_ip:
+                matched = False
+                if is_wildcard:
+                    matched = match_wildcard_ip(target_ip, raddr_ip)
+                else:
+                    matched = (raddr_ip == target_ip)
+                if matched:
                     found = True
                     try:
                         process = psutil.Process(conn.pid)
@@ -194,13 +237,17 @@ def monitor_connection(target_ip: str, webhook_url: str = None,
 
 def monitor_all_ips(targets: Set[str], webhook_url: str = None, 
                    send_interval: int = None,
-                   domain: str = None):
+                   domain: str = None,
+                   wildcard_pattern: str = None):
     """
     监控所有目标IP地址
     """
     print("\n正在监控以下IP地址的连接:")
-    for ip in sorted(targets):
-        print(f"- {ip}")
+    if wildcard_pattern:
+        print(f"- {wildcard_pattern} (通配符模式)")
+    else:
+        for ip in sorted(targets):
+            print(f"- {ip}")
     print("\n按Ctrl+C停止监控")
     print("=" * 50)
 
@@ -223,11 +270,16 @@ def monitor_all_ips(targets: Set[str], webhook_url: str = None,
                     print("=" * 50)
                 last_resolve_time = now
 
-        # 遍历当前目标IP集合
-        for ip in list(targets):
-            found, new_send_time = monitor_connection(ip, webhook_url, last_send_time, send_interval)
+        # 遍历当前目标IP集合或通配符模式
+        if wildcard_pattern:
+            found, new_send_time = monitor_connection(wildcard_pattern, webhook_url, last_send_time, send_interval, is_wildcard=True)
             if found and new_send_time:
                 last_send_time = new_send_time
+        else:
+            for ip in list(targets):
+                found, new_send_time = monitor_connection(ip, webhook_url, last_send_time, send_interval)
+                if found and new_send_time:
+                    last_send_time = new_send_time
         # 控制轮询间隔
         time.sleep(POLL_INTERVAL)
 
@@ -299,17 +351,35 @@ def monitor_all_connections(webhook_url: str = None, print_interval: int = 5):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='网络连接监控工具')
+    HELP_TEXT = '''参数:
+  -t <IP地址>       监控指定IPv4，可用通配符(如 115.*.*.134)
+  -d <域名>         监控指定域名
+  -a <秒>           全局模式：刷新间隔
+  -w <webhook_url>  飞书 webhook
+  -s <秒>           通知节流间隔，默认30
+  -h                显示此帮助
+'''
+
+    parser = argparse.ArgumentParser(
+        description='网络连接监控工具',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False
+    )
     group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument('-t', '--target', help='要监控的目标IP地址')
+    group.add_argument('-t', '--target', help='要监控的目标IP地址（支持通配符）')
     group.add_argument('-d', '--domain', help='要监控的目标域名')
     parser.add_argument('-w', '--webhook', help='飞书webhook URL')
-    parser.add_argument('-s', '--send-interval', type=int, default=300,
-                      help='飞书通知发送间隔(秒)')
+    parser.add_argument('-s', '--send-interval', type=int, default=30,
+                      help='飞书通知发送间隔(秒)，默认30')
     parser.add_argument('-a', '--all', type=int,
                       help='全局IPv4统计模式，前台刷新间隔(秒)，例如 -a 5')
+    parser.add_argument('-h', '--help', action='store_true', help=argparse.SUPPRESS)
     
     args = parser.parse_args()
+
+    if args.help:
+        print(HELP_TEXT)
+        sys.exit(0)
     
     # 检查权限
     check_permissions()
@@ -334,11 +404,17 @@ def main():
         sys.exit(1)
 
     # 处理目标IP
+    wildcard_pattern = None
     if args.target:
-        if not is_valid_ip(args.target):
-            print(f"错误: {args.target} 不是有效的IP地址")
+        if is_wildcard_ip(args.target):
+            wildcard_pattern = args.target
+            print(f"使用通配符IP模式: {args.target}")
+        elif not is_valid_ip(args.target):
+            print(f"错误: {args.target} 不是有效的IP地址或通配符IP格式")
+            print("示例: 115.*.*.134 或 115.*.*.*")
             sys.exit(1)
-        targets.add(args.target)
+        else:
+            targets.add(args.target)
     
     # 处理域名
     if args.domain:
@@ -356,7 +432,7 @@ def main():
         # 如果是域名模式，传入域名；IP模式则不需要
         domain = args.domain if args.domain else None
         monitor_all_ips(targets, args.webhook, args.send_interval,
-                        domain=domain)
+                        domain=domain, wildcard_pattern=wildcard_pattern)
     except KeyboardInterrupt:
         print("\n停止监控")
         sys.exit(0)

@@ -22,7 +22,7 @@
 #define MAX_CMDLINE 4096
 #define MAX_PROC_NAME 256
 #define MAX_IPS 32
-#define DEFAULT_NOTIFY_INTERVAL 300  // 默认通知间隔（秒）
+#define DEFAULT_NOTIFY_INTERVAL 30   // 默认通知间隔（秒）
 #define MAX_MESSAGE_SIZE 8192
 #define MAX_FD_PATH 4096
 #define MAX_DIRENT_NAME 256
@@ -159,6 +159,58 @@ void init_curl_buffer(CurlBuffer *buf) {
     if (buf->data) buf->data[0] = '\0';
 }
 
+/* 将消息转义为 JSON 安全字符串，处理 ", \, 换行等控制字符 */
+static void escape_json_string(const char *input, char *output, size_t out_size) {
+    size_t out_idx = 0;
+    for (const char *p = input; *p && out_idx + 6 < out_size; ++p) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '\"':
+                output[out_idx++] = '\\';
+                output[out_idx++] = '\"';
+                break;
+            case '\\':
+                output[out_idx++] = '\\';
+                output[out_idx++] = '\\';
+                break;
+            case '\b':
+                output[out_idx++] = '\\';
+                output[out_idx++] = 'b';
+                break;
+            case '\f':
+                output[out_idx++] = '\\';
+                output[out_idx++] = 'f';
+                break;
+            case '\n':
+                output[out_idx++] = '\\';
+                output[out_idx++] = 'n';
+                break;
+            case '\r':
+                output[out_idx++] = '\\';
+                output[out_idx++] = 'r';
+                break;
+            case '\t':
+                output[out_idx++] = '\\';
+                output[out_idx++] = 't';
+                break;
+            default:
+                if (c < 0x20) {
+                    /* 其他控制字符转为 \u00XX */
+                    int written = snprintf(output + out_idx, out_size - out_idx, "\\u%04x", c);
+                    if (written < 0 || (size_t)written >= out_size - out_idx) {
+                        output[out_idx] = '\0';
+                        return;
+                    }
+                    out_idx += (size_t)written;
+                } else {
+                    output[out_idx++] = (char)c;
+                }
+                break;
+        }
+    }
+    output[out_idx] = '\0';
+}
+
 size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     CurlBuffer *buf = (CurlBuffer *)userp;
@@ -187,9 +239,12 @@ void send_feishu_notification(const char *message) {
         CurlBuffer buf;
         init_curl_buffer(&buf);
 
+        char escaped_message[MAX_MESSAGE_SIZE * 2];
+        escape_json_string(message, escaped_message, sizeof(escaped_message));
+
         char post_data[4096];
         snprintf(post_data, sizeof(post_data),
-                 "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}", message);
+                 "{\"msg_type\":\"text\",\"content\":{\"text\":\"%s\"}}", escaped_message);
 
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -204,7 +259,14 @@ void send_feishu_notification(const char *message) {
         if (res != CURLE_OK) {
             fprintf(stderr, "发送飞书通知失败: %s\n", curl_easy_strerror(res));
         } else {
-            last_notification = current_time;
+            long http_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            if (http_code != 200) {
+                fprintf(stderr, "发送飞书通知失败: HTTP %ld, 响应: %s\n",
+                        http_code, buf.data ? buf.data : "(空响应)");
+            } else {
+                last_notification = current_time;
+            }
         }
 
         curl_slist_free_all(headers);
@@ -531,13 +593,13 @@ void add_seen_ip_info(const char *remote_ip,
 
 void print_usage(const char *program_name) {
     printf("用法:\n");
-    printf("监控 IP: %s -t <目标IP>\n", program_name);
-    printf("监控域名: %s -d <域名>\n", program_name);
-    printf("全局监控: %s -a <前台刷新间隔(秒)>\n", program_name);
-    printf("\n可选参数:\n");
-    printf("  -w <webhook_url>  设置飞书 webhook URL\n");
-    printf("  -s <seconds>      设置通知间隔（秒），默认300秒\n");
-    printf("  -q               静默模式，减少输出\n");
+    printf("  -t <IP/通配符IP>  监控指定IPv4，如 115.120.245.134 或 115.*.*.134\n");
+    printf("  -d <域名>         监控指定域名（自动解析并刷新）\n");
+    printf("  -a <秒>           全局监控模式，前台刷新间隔\n");
+    printf("  -w <webhook_url>  飞书 webhook 地址\n");
+    printf("  -s <秒>           通知间隔，默认30秒\n");
+    printf("  -q                静默模式，减少输出\n");
+    printf("  -h                显示帮助\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -548,6 +610,7 @@ int main(int argc, char *argv[]) {
     int opt;
     char *target = NULL;
     int is_domain = 0;
+    int is_wildcard = 0;
     int monitor_all = 0;
     int print_interval = 5;
     char *ip_list[MAX_IPS] = {NULL};
@@ -562,6 +625,36 @@ int main(int argc, char *argv[]) {
                 }
                 target = optarg;
                 is_domain = 0;
+                /* 校验 IPv4 或通配符 IPv4（如 115.*.*.134） */
+                {
+                    int parts = 0, has_wild = 0, ok = 1;
+                    const char *p = target;
+                    while (*p && parts < 4) {
+                        if (*p == '*') {
+                            has_wild = 1;
+                            p++;
+                            if (*p == '.' || *p == '\0') {
+                                parts++;
+                                if (*p == '.') p++;
+                            } else { ok = 0; break; }
+                        } else if (isdigit((unsigned char)*p)) {
+                            int num = 0;
+                            while (isdigit((unsigned char)*p)) {
+                                num = num * 10 + (*p - '0');
+                                if (num > 255) { ok = 0; break; }
+                                p++;
+                            }
+                            if (!ok) break;
+                            parts++;
+                            if (*p == '.') p++;
+                        } else { ok = 0; break; }
+                    }
+                    if (!ok || parts != 4) {
+                        printf("错误: %s 不是有效的IPv4或通配符IP（示例 115.*.*.134 或 115.*.*.*）\n", target);
+                        return 1;
+                    }
+                    if (has_wild) is_wildcard = 1;
+                }
                 break;
             case 'd':
                 if (target) {
@@ -618,10 +711,7 @@ int main(int argc, char *argv[]) {
     // 目标模式：准备 IP 列表
     if (!monitor_all) {
         if (!is_domain) {
-            if (!is_valid_ip(target)) {
-                printf("错误: %s 不是有效的IP地址\n", target);
-                return 1;
-            }
+            /* 目标 IP 或通配符 IP */
             ip_list[0] = strdup(target);
             ip_count = 1;
         } else {
@@ -798,7 +888,44 @@ int main(int argc, char *argv[]) {
 
                         if (get_ipv4_from_inode(inode, local_ip, &local_port,
                                                 remote_ip, &remote_port)) {
-                            if (strcmp(remote_ip, ip_list[i]) == 0) {
+                            int match = 0;
+                            if (is_wildcard) {
+                                char r1[4][4] = {{0}}, p1[4][4] = {{0}};
+                                int rp = 0, pp = 0, k = 0;
+                                const char *pr = remote_ip;
+                                const char *pt = ip_list[i];
+                                while (*pr && rp < 4) {
+                                    k = 0;
+                                    while (*pr && *pr != '.' && k < 3) r1[rp][k++] = *pr++;
+                                    r1[rp][k] = '\0';
+                                    if (*pr == '.') pr++;
+                                    rp++;
+                                }
+                                while (*pt && pp < 4) {
+                                    if (*pt == '*') {
+                                        p1[pp][0] = '*'; p1[pp][1] = '\0';
+                                        pt++;
+                                    } else {
+                                        k = 0;
+                                        while (*pt && *pt != '.' && k < 3) p1[pp][k++] = *pt++;
+                                        p1[pp][k] = '\0';
+                                    }
+                                    if (*pt == '.') pt++;
+                                    pp++;
+                                }
+                                if (rp == 4 && pp == 4) {
+                                    match = 1;
+                                    for (int seg = 0; seg < 4; seg++) {
+                                        if (p1[seg][0] != '*' && strcmp(p1[seg], r1[seg]) != 0) {
+                                            match = 0; break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match = (strcmp(remote_ip, ip_list[i]) == 0);
+                            }
+
+                            if (match) {
                                 ProcessInfo info;
                                 get_process_info(pid, &info);
 
